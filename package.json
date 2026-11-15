@@ -1,0 +1,23 @@
+{
+  "name": "fixwerk",
+  "private": true,
+  "description": "Fixwerk – real-time platform for running community repair cafés",
+  "type": "module",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,magenta \"npm -w server run dev\" \"npm -w client run dev\"",
+    "build": "npm -w client run build",
+    "start": "NODE_ENV=production npm -w server run start",
+    "test": "npm -w server test",
+    "reset-db": "rm -rf server/data"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.7"
+  }
+}
