@@ -164,7 +164,72 @@ export function seedIfEmpty(db) {
            WHERE status = 'done' AND id % 5 != 0`);
   db.exec(`UPDATE tickets SET feedback = 'So happy it works again – thank you!' WHERE rating = 5 AND id % 7 = 0`);
 
+  seedOperations(db);
+
   // In-repair seeds must not have started in the future.
   db.prepare(`UPDATE tickets SET started_at = ? WHERE status = 'in_repair' AND started_at > ?`).run(new Date().toISOString(), new Date().toISOString());
   return true;
+}
+
+// [name, category, stock, minStock, unitCost €]
+const PARTS = [
+  ['Fuse 5A (glass)', 'electronics', 40, 10, 0.3],
+  ['Micro-USB socket', 'electronics', 3, 5, 1.2],
+  ['Drive belt, assorted', 'electronics', 6, 3, 4.5],
+  ['Thermal paste (1 g)', 'computers', 12, 4, 1.8],
+  ['2.5" SSD 240 GB', 'computers', 2, 2, 22],
+  ['O-ring set', 'appliances', 25, 8, 3],
+  ['Carbon brushes (pair)', 'appliances', 4, 4, 6.5],
+  ['Zipper slider #5', 'textiles', 30, 10, 0.9],
+  ['Denim patch', 'textiles', 14, 5, 1.5],
+  ['Inner tube 28"', 'bikes', 5, 6, 5.5],
+  ['Brake pads (pair)', 'bikes', 9, 4, 7],
+  ['Gear cable', 'bikes', 15, 5, 2.4],
+  ['E27 lamp socket', 'furniture', 7, 3, 2.9],
+  ['Wood glue (50 ml)', 'furniture', 4, 2, 3.5],
+  ['Watch battery CR2032', 'jewelry', 18, 10, 0.8],
+  ['Lobster clasp', 'jewelry', 22, 5, 0.6],
+];
+
+/** Parts inventory, volunteer sign-ups and ticket history for the demo. */
+function seedOperations(db) {
+  const insertPart = db.prepare('INSERT INTO parts (name, category, stock, min_stock, unit_cost) VALUES (?, ?, ?, ?, ?)');
+  for (const p of PARTS) insertPart.run(...p);
+
+  // Historic parts usage: one matching part for every third successful repair.
+  const parts = db.prepare('SELECT id, category FROM parts').all();
+  const fixedTickets = db.prepare(`SELECT id, category FROM tickets WHERE status = 'done' AND outcome IN ('fixed', 'partial')`).all();
+  const usePart = db.prepare('INSERT INTO ticket_parts (ticket_id, part_id, qty) VALUES (?, ?, ?)');
+  for (const t of fixedTickets) {
+    const options = parts.filter((p) => p.category === t.category);
+    if (options.length && t.id % 3 === 0) usePart.run(t.id, options[t.id % options.length].id, 1 + (t.id % 2));
+  }
+
+  // Sign-ups: everyone who repaired at an event attended it; plus a roster for the next events.
+  db.exec(`INSERT OR IGNORE INTO event_fixers (event_id, user_id)
+           SELECT DISTINCT event_id, fixer_id FROM tickets WHERE fixer_id IS NOT NULL`);
+  const live = db.prepare(`SELECT id FROM events WHERE status = 'live'`).get();
+  const planned = db.prepare(`SELECT id FROM events WHERE status = 'planned'`).get();
+  const fixers = db.prepare(`SELECT id, email FROM users WHERE role = 'fixer'`).all();
+  const rsvp = db.prepare('INSERT OR IGNORE INTO event_fixers (event_id, user_id) VALUES (?, ?)');
+  for (const f of fixers) {
+    if (live && f.email !== 'jonas@fixwerk.demo') rsvp.run(live.id, f.id);
+    if (planned && ['mehmet@fixwerk.demo', 'ingrid@fixwerk.demo', 'aiko@fixwerk.demo'].includes(f.email)) rsvp.run(planned.id, f.id);
+  }
+
+  // Audit trail rebuilt from the ticket timestamps.
+  db.exec(`INSERT INTO ticket_log (ticket_id, action, actor_id, detail, at)
+             SELECT id, 'checked_in', NULL, NULL, created_at FROM tickets;
+           INSERT INTO ticket_log (ticket_id, action, actor_id, detail, at)
+             SELECT t.id, 'claimed', t.fixer_id, substr(u.name, 1, instr(u.name || ' ', ' ') - 1), t.started_at
+               FROM tickets t JOIN users u ON u.id = t.fixer_id WHERE t.started_at IS NOT NULL;
+           INSERT INTO ticket_log (ticket_id, action, actor_id, detail, at)
+             SELECT id, 'finished', fixer_id, outcome, finished_at FROM tickets WHERE status = 'done';
+           INSERT INTO ticket_log (ticket_id, action, actor_id, detail, at)
+             SELECT id, 'rated', NULL, CAST(rating AS TEXT), finished_at FROM tickets WHERE rating IS NOT NULL;`);
+  // Two waiting live visitors left an email, so the mailbox fills during the demo.
+  if (live) {
+    db.prepare(`UPDATE tickets SET visitor_email = lower(substr(visitor_name, 1, instr(visitor_name, ' ') - 1)) || '@example.com'
+                 WHERE id IN (SELECT id FROM tickets WHERE event_id = ? AND status = 'waiting' ORDER BY created_at LIMIT 2)`).run(live.id);
+  }
 }

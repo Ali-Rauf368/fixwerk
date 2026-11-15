@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Link } from 'react-router';
 import { api, tokenStore } from '../api.js';
+import OrgTabs from '../components/OrgTabs.jsx';
 import { ErrorNote, Pill, Spinner, fmtDate } from '../components/ui.jsx';
 import { useApi } from '../hooks.js';
 
@@ -22,6 +23,8 @@ export default function Organizer() {
   };
 
   return (
+    <>
+    <OrgTabs />
     <div className="grid gap-6 lg:grid-cols-[1fr_22rem]">
       <section className="space-y-3">
         <h1 className="text-2xl font-bold">Events</h1>
@@ -33,7 +36,7 @@ export default function Organizer() {
                 <h2 className="font-bold">{e.title}</h2>
                 <Pill cls={e.status === 'live' ? 'bg-red-100 text-red-700' : 'bg-stone-100 text-stone-600'}>{e.status}</Pill>
               </div>
-              <p className="text-sm text-stone-500">{fmtDate(e.starts_at)} · {e.location} · {e.tickets} items</p>
+              <p className="text-sm text-stone-500">{fmtDate(e.starts_at)} · {e.location} · {e.tickets} items · {e.volunteers} volunteers</p>
             </div>
             {e.tickets > 0 && (
               <button type="button" className="btn-ghost text-xs" onClick={() => run(() => downloadCsv(e))}>Export CSV</button>
@@ -63,6 +66,7 @@ export default function Organizer() {
         <button className="btn-primary w-full">Create event</button>
       </form>
     </div>
+    </>
   );
 }
 

@@ -18,6 +18,11 @@ At a repair café, volunteers fix broken things (toasters, bikes, jeans, laptops
 | **Visitor feedback** | Visitors rate the repair (1–5 ★) from the tracking page, once per ticket. Ratings appear on the impact page and per fixer. |
 | **Repair wiki** | Every finished repair becomes a searchable note, so the next fixer doesn't start from zero. |
 | **Impact dashboard** | Shows waste and CO₂e avoided, success rate per category and per event, typical repair time, visitor rating, and a volunteer leaderboard. |
+| **Volunteer sign-ups** | Fixers sign up for events. Matching and wait estimates count only the volunteers who are actually there. |
+| **Spare-parts inventory** | Fixers record the parts they used. Stock goes down in the same database transaction as the repair, so a shortage rolls the whole step back. Low stock is flagged and organizers can restock. |
+| **Ticket history** | Every step (checked in, claimed, assigned, released, finished, rated) is logged and shown to the visitor as a timeline. |
+| **Team management** | Organizers add fixers or organizers and can deactivate accounts. Deactivation blocks sign-in and invalidates existing sessions immediately. |
+| **Visitor emails** | Visitors who leave an email get "It's your turn" and "Your repair is done" messages. They are queued in an outbox table; in the demo the organizer **Mailbox** shows them instead of sending them. |
 | **CSV export** | Organizers download an event's data as a CSV file that opens correctly in Excel and is protected against formula injection. |
 
 ## Tech stack
@@ -45,6 +50,14 @@ The database is created and filled with demo data on the first start: 6 past eve
 | ingrid@fixwerk.demo | Fixer: textiles, toys |
 | tomasz@fixwerk.demo | Fixer: bikes, furniture |
 
+Or run the production build in Docker:
+
+```bash
+docker compose up --build   # http://localhost:4300, data kept in a Docker volume
+```
+
+GitHub Actions runs the tests, the client build and the Docker build on every push.
+
 Other commands:
 
 ```bash
@@ -70,6 +83,8 @@ npm run reset-db   # delete the local database; it is re-seeded on the next star
 - **Race-safe claiming:** a claim is a conditional `UPDATE … WHERE status = 'waiting'`. If two fixers click at the same moment, one gets a clear 409 error instead of both getting the item.
 - **Triage:** word overlap (Jaccard similarity) against past repairs, combined with keyword hints. The forecast is a Laplace-smoothed success rate over the most similar repairs in the guessed category. Everything runs locally, with no external AI service. The code is in [`server/src/domain/triage.js`](server/src/domain/triage.js).
 - **Hardening:** per-IP rate limits on login, check-in, triage and feedback (HTTP 429), security headers, and additive database migrations so older databases keep working.
+- **Transactions:** claiming and finishing a repair run in SQLite transactions. Stock is decremented with `UPDATE … WHERE stock >= qty`, so concurrent repairs can never drive stock negative.
+- **Outbox pattern:** emails are written to an `outbox` table inside the same request, so a mail worker can deliver them later without losing any if the mail server is down.
 - **Privacy:** public endpoints only show the visitor's first name, never their email.
 - **Real-time model:** the server emits a lightweight `board:changed` signal to the event's Socket.IO room, and clients refetch. This keeps a single source of truth: REST.
 - **Impact factors** (average weight and CO₂e per kg, by category) are rounded, illustrative estimates in [`server/src/domain/categories.js`](server/src/domain/categories.js), not audited lifecycle (LCA) data.

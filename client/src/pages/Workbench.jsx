@@ -50,6 +50,7 @@ function Bench({ eventId }) {
 
   if (!data) return error ? <ErrorNote error={error} /> : <Spinner />;
   const isOrganizer = user.role === 'organizer';
+  const signedUp = data.roster.includes(user.id);
   const mine = data.inRepair.filter((t) => t.fixer_id === user.id);
   const others = data.inRepair.filter((t) => t.fixer_id !== user.id);
 
@@ -58,11 +59,17 @@ function Bench({ eventId }) {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h1 className="text-2xl font-bold">Workbench</h1>
-          <p className="text-sm text-stone-500">{data.event.title} · {data.waiting.length} waiting · {data.inRepair.length} on the bench</p>
+          <p className="text-sm text-stone-500">{data.event.title} · {data.waiting.length} waiting · {data.inRepair.length} on the bench · {data.roster.length} volunteers signed up</p>
         </div>
         <span className={`text-xs ${connected ? 'text-brand-600' : 'text-stone-400'}`}>{connected ? '● synced live' : 'connecting…'}</span>
       </div>
       <ErrorNote error={actionError} />
+      {!isOrganizer && !signedUp && (
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm">
+          <span className="flex-1">You haven’t signed up for this event yet, so you’re not counted in matching or wait times. Claiming an item signs you up automatically.</span>
+          <button type="button" className="btn-primary" onClick={() => act(`/events/${eventId}/rsvp`)}>I’m here today</button>
+        </div>
+      )}
       <div className="fixed right-4 bottom-4 z-20 space-y-2" aria-live="polite">
         {toasts.map((m) => (
           <div key={m.code} className="flex items-center gap-3 rounded-xl bg-ink px-4 py-3 text-sm text-white shadow-lg">
@@ -77,7 +84,7 @@ function Bench({ eventId }) {
           <h2 className="mb-3 font-bold">My bench</h2>
           {mine.length ? (
             <div className="grid gap-4 md:grid-cols-2">
-              {mine.map((t) => <FinishCard key={t.id} t={t} act={act} />)}
+              {mine.map((t) => <FinishCard key={t.id} t={t} act={act} parts={data.parts} />)}
             </div>
           ) : (
             <p className="card text-sm text-stone-500">Nothing on your bench. Claim the next item below. Items marked ★ fit your skills.</p>
@@ -132,7 +139,7 @@ function Bench({ eventId }) {
         <h2 className="mb-3 font-bold">{isOrganizer ? 'On the bench' : 'Other benches'}</h2>
         <div className="grid gap-4 md:grid-cols-2">
           {(isOrganizer ? data.inRepair : others).map((t) =>
-            isOrganizer ? <FinishCard key={t.id} t={t} act={act} /> : (
+            isOrganizer ? <FinishCard key={t.id} t={t} act={act} parts={data.parts} /> : (
               <div key={t.id} className="card text-sm"><b>{t.item}</b> · {t.fixer_name} · {minutesSince(t.started_at)} min</div>
             ),
           )}
@@ -142,8 +149,19 @@ function Bench({ eventId }) {
   );
 }
 
-function FinishCard({ t, act }) {
+function FinishCard({ t, act, parts }) {
   const [outcome, setOutcome] = useState('fixed');
+  const [used, setUsed] = useState([]); // [{ partId, qty }]
+  const [pick, setPick] = useState('');
+  // Parts for this item's category first.
+  const sorted = [...parts].sort((a, b) => (b.category === t.category) - (a.category === t.category) || a.name.localeCompare(b.name));
+  const partName = (id) => parts.find((p) => p.id === id)?.name ?? 'Part';
+  const addPart = () => {
+    const id = Number(pick);
+    if (!id) return;
+    setUsed((u) => (u.some((x) => x.partId === id) ? u.map((x) => (x.partId === id ? { ...x, qty: x.qty + 1 } : x)) : [...u, { partId: id, qty: 1 }]));
+    setPick('');
+  };
   const [notes, setNotes] = useState('');
   const [weightKg, setWeight] = useState('');
   return (
@@ -151,7 +169,7 @@ function FinishCard({ t, act }) {
       className="card space-y-3 border-indigo-200"
       onSubmit={(e) => {
         e.preventDefault();
-        act(`/tickets/${t.id}/finish`, { outcome, notes, weightKg });
+        act(`/tickets/${t.id}/finish`, { outcome, notes, weightKg, parts: used });
       }}
     >
       <div className="flex justify-between gap-2">
@@ -170,6 +188,25 @@ function FinishCard({ t, act }) {
         ))}
       </div>
       <textarea className="input" rows={2} maxLength={1000} placeholder="What did you do? (goes into the repair wiki)" value={notes} onChange={(e) => setNotes(e.target.value)} />
+      <div className="space-y-2 rounded-lg bg-stone-50 p-2">
+        <div className="flex gap-2">
+          <select className="input py-1.5" value={pick} onChange={(e) => setPick(e.target.value)} aria-label="Spare part used">
+            <option value="">Spare part used? (optional)</option>
+            {sorted.map((p) => <option key={p.id} value={p.id}>{p.category === t.category ? '★ ' : ''}{p.name} ({p.stock} left)</option>)}
+          </select>
+          <button type="button" className="btn-ghost px-3 py-1.5" onClick={addPart} disabled={!pick}>Add</button>
+        </div>
+        {used.length > 0 && (
+          <ul className="flex flex-wrap gap-1">
+            {used.map((u) => (
+              <li key={u.partId} className="flex items-center gap-1 rounded-full bg-white px-2 py-0.5 text-xs ring-1 ring-stone-200">
+                {u.qty}× {partName(u.partId)}
+                <button type="button" aria-label={`Remove ${partName(u.partId)}`} className="text-stone-400 hover:text-red-600" onClick={() => setUsed((x) => x.filter((y) => y.partId !== u.partId))}>✕</button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
       <div className="flex items-center gap-2">
         <input className="input w-28" type="number" step="0.1" min="0.1" max="200" placeholder="kg (opt.)" value={weightKg} onChange={(e) => setWeight(e.target.value)} />
         <button className="btn-primary flex-1">Finish repair</button>

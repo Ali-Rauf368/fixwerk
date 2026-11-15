@@ -2,7 +2,8 @@ import { randomInt } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import express from 'express';
-import { signToken, verifyPassword, verifyToken } from './auth.js';
+import { hashPassword, signToken, verifyPassword, verifyToken } from './auth.js';
+import { tx } from './db.js';
 import { CATEGORIES, OUTCOMES, isCategory } from './domain/categories.js';
 import { summarize } from './domain/impact.js';
 import { estimateWaitMin, rankFixers, typicalDurationMin } from './domain/matching.js';
@@ -76,15 +77,32 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
     if (!t) throw new HttpError(404, 'Ticket not found');
     return t;
   };
-  const fixersWithLoad = () =>
-    db
+  /** Fixers available at an event: those who signed up, or every active fixer if nobody has yet. */
+  const fixersWithLoad = (eventId) => {
+    const rows = db
       .prepare(
         `SELECT u.id, u.name, u.skills,
-                (SELECT COUNT(*) FROM tickets t WHERE t.fixer_id = u.id AND t.status = 'in_repair') AS activeCount
-           FROM users u WHERE u.role = 'fixer' ORDER BY u.name`,
+                (SELECT COUNT(*) FROM tickets t WHERE t.fixer_id = u.id AND t.status = 'in_repair') AS activeCount,
+                EXISTS (SELECT 1 FROM event_fixers ef WHERE ef.user_id = u.id AND ef.event_id = ?) AS attending
+           FROM users u WHERE u.role = 'fixer' AND u.active = 1 ORDER BY u.name`,
       )
-      .all()
-      .map((f) => ({ ...f, skills: JSON.parse(f.skills) }));
+      .all(eventId ?? -1)
+      .map((f) => ({ ...f, skills: JSON.parse(f.skills), attending: Boolean(f.attending) }));
+    const attending = rows.filter((f) => f.attending);
+    return attending.length ? attending : rows;
+  };
+
+  /** Append to a ticket's audit trail. */
+  const log = (ticketId, action, actorId = null, detail = null) =>
+    db.prepare('INSERT INTO ticket_log (ticket_id, action, actor_id, detail, at) VALUES (?, ?, ?, ?, ?)').run(ticketId, action, actorId, detail, now());
+
+  /** Queue an email to the visitor (delivered by a mail worker; shown in the dev mailbox). */
+  const mail = (ticket, subject, body) => {
+    if (!ticket.visitor_email) return;
+    db.prepare('INSERT INTO outbox (to_email, subject, body, ticket_id, created_at) VALUES (?, ?, ?, ?, ?)').run(
+      ticket.visitor_email, subject, body, ticket.id, now(),
+    );
+  };
   const history = () =>
     db.prepare(`SELECT fixer_id, category, outcome, started_at, finished_at FROM tickets WHERE status = 'done'`).all();
 
@@ -94,7 +112,7 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
       .prepare(`SELECT * FROM tickets WHERE event_id = ? AND status = 'waiting' ORDER BY created_at, id`)
       .all(eventId);
     const duration = typicalDurationMin(history());
-    const fixerCount = fixersWithLoad().length;
+    const fixerCount = fixersWithLoad(eventId).length;
     return waiting.map((t, i) => ({ ...t, position: i + 1, estimatedWaitMin: estimateWaitMin(i + 1, fixerCount, duration) }));
   };
 
@@ -113,6 +131,7 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
       const token = (req.get('authorization') ?? '').replace(/^Bearer\s+/i, '');
       const user = verifyToken(token, secret);
       if (!user) throw new HttpError(401, 'Please sign in');
+      if (!db.prepare('SELECT active FROM users WHERE id = ?').get(user.id)?.active) throw new HttpError(401, 'Your account is not active');
       if (roles.length && !roles.includes(user.role)) throw new HttpError(403, 'You are not allowed to do this');
       req.user = user;
       next();
@@ -128,6 +147,7 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
     if (!user || !verifyPassword(req.body?.password ?? '', user.password_hash)) {
       throw new HttpError(401, 'Wrong email or password');
     }
+    if (!user.active) throw new HttpError(403, 'This account has been deactivated. Please contact an organizer.');
     const profile = { id: user.id, name: user.name, role: user.role, skills: JSON.parse(user.skills) };
     res.json({ token: signToken({ id: user.id, name: user.name, role: user.role }, secret), user: profile });
   });
@@ -149,7 +169,8 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
         `SELECT e.*,
                 COUNT(t.id) AS tickets,
                 SUM(t.status = 'waiting') AS waiting,
-                SUM(t.status = 'done' AND t.outcome IN ('fixed', 'partial')) AS fixed
+                SUM(t.status = 'done' AND t.outcome IN ('fixed', 'partial')) AS fixed,
+                (SELECT COUNT(*) FROM event_fixers ef WHERE ef.event_id = e.id) AS volunteers
            FROM events e LEFT JOIN tickets t ON t.event_id = e.id
           GROUP BY e.id ORDER BY e.starts_at DESC`,
       )
@@ -193,7 +214,7 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new HttpError(400, 'Email looks invalid');
 
     const code = newCode();
-    db.prepare(
+    const { lastInsertRowid } = db.prepare(
       `INSERT INTO tickets (event_id, code, visitor_name, visitor_email, item, category, brand, problem, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
@@ -207,6 +228,7 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
       text(req.body?.problem, 'Problem description', { max: 600 }),
       now(),
     );
+    log(Number(lastInsertRowid), 'checked_in');
     notify(ev.id, { type: 'ticket:new', code, category, item: req.body.item.trim() });
     const mine = queueFor(ev.id).find((t) => t.code === code);
     res.status(201).json({ code, position: mine.position, estimatedWaitMin: mine.estimatedWaitMin });
@@ -265,6 +287,11 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
       position: queued?.position ?? null,
       estimatedWaitMin: queued?.estimatedWaitMin ?? null,
       rating: t.rating,
+      parts: db.prepare('SELECT p.name, tp.qty FROM ticket_parts tp JOIN parts p ON p.id = tp.part_id WHERE tp.ticket_id = ?').all(t.id),
+      timeline: db
+        .prepare('SELECT l.action, l.detail, l.at, u.name AS actor FROM ticket_log l LEFT JOIN users u ON u.id = l.actor_id WHERE l.ticket_id = ? ORDER BY l.at, l.id')
+        .all(t.id)
+        .map((l) => ({ action: l.action, detail: l.detail, at: l.at, actor: l.actor ? firstName(l.actor) : null })),
     });
   });
 
@@ -278,14 +305,16 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
       .prepare('UPDATE tickets SET rating = ?, feedback = ? WHERE id = ? AND rating IS NULL')
       .run(rating, text(req.body?.comment, 'Comment', { max: 500, required: false }), t.id);
     if (!changes) throw new HttpError(409, 'Feedback was already given – thank you!');
+    log(t.id, 'rated', null, String(rating));
     res.status(201).json({ ok: true });
   });
 
   // ---------- workbench (fixers & organizers) ----------
   api.get('/events/:id/workbench', auth('fixer', 'organizer'), (req, res) => {
     const ev = getEvent(req.params.id);
-    const fixers = fixersWithLoad();
+    const fixers = fixersWithLoad(ev.id);
     const hist = history();
+    const roster = db.prepare('SELECT user_id FROM event_fixers WHERE event_id = ?').all(ev.id).map((r) => r.user_id);
     const inRepair = db
       .prepare(
         `SELECT t.*, u.name AS fixer_name FROM tickets t LEFT JOIN users u ON u.id = t.fixer_id
@@ -297,31 +326,42 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
       fixers: fixers.map(({ id, name, skills, activeCount }) => ({ id, name, skills, activeCount })),
       waiting: queueFor(ev.id).map((t) => ({ ...t, suggestions: rankFixers(t, fixers, hist).slice(0, 3) })),
       inRepair,
+      roster,
+      parts: db.prepare('SELECT id, name, category, stock FROM parts WHERE stock > 0 ORDER BY name').all(),
     });
   });
 
-  const startRepair = (ticket, fixerId) => {
+  const startRepair = (ticket, fixerId, actor) => {
     const ev = getEvent(ticket.event_id);
     if (ev.status !== 'live') throw new HttpError(409, 'The event is not live');
-    const fixer = db.prepare(`SELECT id FROM users WHERE id = ? AND role = 'fixer'`).get(Number(fixerId));
+    const fixer = db.prepare(`SELECT id, name FROM users WHERE id = ? AND role = 'fixer' AND active = 1`).get(Number(fixerId));
     if (!fixer) throw new HttpError(400, 'Unknown fixer');
-    // Conditional update so two fixers cannot grab the same ticket.
-    const { changes } = db
-      .prepare(`UPDATE tickets SET status = 'in_repair', fixer_id = ?, started_at = ? WHERE id = ? AND status = 'waiting'`)
-      .run(fixer.id, now(), ticket.id);
-    if (!changes) throw new HttpError(409, 'Someone else already took this item');
+    tx(db, () => {
+      // Conditional update so two fixers cannot grab the same ticket.
+      const { changes } = db
+        .prepare(`UPDATE tickets SET status = 'in_repair', fixer_id = ?, started_at = ? WHERE id = ? AND status = 'waiting'`)
+        .run(fixer.id, now(), ticket.id);
+      if (!changes) throw new HttpError(409, 'Someone else already took this item');
+      db.prepare('INSERT OR IGNORE INTO event_fixers (event_id, user_id) VALUES (?, ?)').run(ev.id, fixer.id);
+      log(ticket.id, actor.id === fixer.id ? 'claimed' : 'assigned', actor.id, firstName(fixer.name));
+      mail(
+        ticket,
+        `It's your turn: ${ticket.item}`,
+        `Hi ${firstName(ticket.visitor_name)},\n\n${firstName(fixer.name)} is ready to look at your ${ticket.item} now. Please come to the repair bench and bring ticket ${ticket.code}.\n\nSee you in a minute!\nYour Fixwerk team`,
+      );
+    });
     notify(ticket.event_id);
   };
 
   api.post('/tickets/:id/claim', auth('fixer'), (req, res) => {
     const t = getTicket(req.params.id);
-    startRepair(t, req.user.id);
+    startRepair(t, req.user.id, req.user);
     res.json(getTicket(t.id));
   });
 
   api.post('/tickets/:id/assign', auth('organizer'), (req, res) => {
     const t = getTicket(req.params.id);
-    startRepair(t, req.body?.fixerId);
+    startRepair(t, req.body?.fixerId, req.user);
     res.json(getTicket(t.id));
   });
 
@@ -334,6 +374,7 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
     const t = getTicket(req.params.id);
     mayWorkOn(t, req.user);
     db.prepare(`UPDATE tickets SET status = 'waiting', fixer_id = NULL, started_at = NULL WHERE id = ?`).run(t.id);
+    log(t.id, 'released', req.user.id);
     notify(t.event_id);
     res.json(getTicket(t.id));
   });
@@ -349,12 +390,36 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
       weight = Number(weight);
       if (!Number.isFinite(weight) || weight <= 0 || weight > 200) throw new HttpError(400, 'Weight must be between 0 and 200 kg');
     }
-    db.prepare(`UPDATE tickets SET status = 'done', outcome = ?, notes = ?, weight_kg = ?, finished_at = ? WHERE id = ?`).run(
-      outcome,
-      text(req.body?.notes, 'Notes', { max: 1000, required: false }),
-      weight,
-      now(),
-      t.id,
+    const notes = text(req.body?.notes, 'Notes', { max: 1000, required: false });
+    const wanted = new Map();
+    for (const p of Array.isArray(req.body?.parts) ? req.body.parts : []) {
+      const partId = Number(p?.partId);
+      const qty = Number(p?.qty);
+      if (!Number.isInteger(partId) || !Number.isInteger(qty) || qty < 1 || qty > 50) throw new HttpError(400, 'Invalid part or quantity');
+      wanted.set(partId, (wanted.get(partId) ?? 0) + qty);
+    }
+
+    // All-or-nothing: stock, parts used, ticket and audit log change together.
+    tx(db, () => {
+      for (const [partId, qty] of wanted) {
+        const part = db.prepare('SELECT * FROM parts WHERE id = ?').get(partId);
+        if (!part) throw new HttpError(400, 'Unknown part');
+        const { changes } = db.prepare('UPDATE parts SET stock = stock - ? WHERE id = ? AND stock >= ?').run(qty, partId, qty);
+        if (!changes) throw new HttpError(409, `Not enough "${part.name}" in stock (${part.stock} left)`);
+        db.prepare('INSERT INTO ticket_parts (ticket_id, part_id, qty) VALUES (?, ?, ?)').run(t.id, partId, qty);
+      }
+      const { changes } = db
+        .prepare(`UPDATE tickets SET status = 'done', outcome = ?, notes = ?, weight_kg = ?, finished_at = ? WHERE id = ? AND status = 'in_repair'`)
+        .run(outcome, notes, weight, now(), t.id);
+      if (!changes) throw new HttpError(409, 'This item is not being repaired');
+      log(t.id, 'finished', req.user.id, outcome);
+    });
+
+    const verdict = { fixed: 'is fixed 🎉', partial: 'is partly fixed', advice: 'could not be fixed today, but we have advice for you', not_fixable: 'could unfortunately not be fixed' }[outcome];
+    mail(
+      t,
+      `Your ${t.item} ${verdict}`,
+      `Hi ${firstName(t.visitor_name)},\n\nyour ${t.item} ${verdict}.${notes ? `\n\nNote from the fixer: ${notes}` : ''}\n\nYou can rate your visit here: /status/${t.code}\n\nThanks for repairing instead of throwing away!\nYour Fixwerk team`,
     );
     notify(t.event_id);
     res.json(getTicket(t.id));
@@ -424,6 +489,115 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
     res.json(rows);
   });
 
+  // ---------- volunteer sign-ups ----------
+  api.get('/events/:id/roster', (req, res) => {
+    const ev = getEvent(req.params.id);
+    const rows = db
+      .prepare(`SELECT u.id, u.name, u.skills FROM event_fixers ef JOIN users u ON u.id = ef.user_id WHERE ef.event_id = ? AND u.active = 1 ORDER BY u.name`)
+      .all(ev.id);
+    res.json(rows.map(withSkills));
+  });
+
+  api.post('/events/:id/rsvp', auth('fixer'), (req, res) => {
+    const ev = getEvent(req.params.id);
+    if (ev.status === 'closed') throw new HttpError(409, 'This event is already over');
+    db.prepare('INSERT OR IGNORE INTO event_fixers (event_id, user_id) VALUES (?, ?)').run(ev.id, req.user.id);
+    notify(ev.id);
+    res.status(201).json({ attending: true });
+  });
+
+  api.delete('/events/:id/rsvp', auth('fixer'), (req, res) => {
+    const ev = getEvent(req.params.id);
+    const busy = db.prepare(`SELECT 1 FROM tickets WHERE event_id = ? AND fixer_id = ? AND status = 'in_repair'`).get(ev.id, req.user.id);
+    if (busy) throw new HttpError(409, 'Finish or release your items first');
+    db.prepare('DELETE FROM event_fixers WHERE event_id = ? AND user_id = ?').run(ev.id, req.user.id);
+    notify(ev.id);
+    res.json({ attending: false });
+  });
+
+  // ---------- team management ----------
+  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const skillList = (v) => {
+    if (v == null) return [];
+    if (!Array.isArray(v) || !v.every(isCategory)) throw new HttpError(400, 'Unknown skill');
+    return [...new Set(v)];
+  };
+
+  api.get('/team', auth('organizer'), (_req, res) => {
+    const rows = db
+      .prepare(
+        `SELECT u.id, u.name, u.email, u.role, u.skills, u.active,
+                (SELECT COUNT(*) FROM tickets t WHERE t.fixer_id = u.id AND t.status = 'done') AS repairs
+           FROM users u ORDER BY u.active DESC, u.role DESC, u.name`,
+      )
+      .all();
+    res.json(rows.map((u) => ({ ...withSkills(u), active: Boolean(u.active) })));
+  });
+
+  api.post('/team', auth('organizer'), (req, res) => {
+    const name = text(req.body?.name, 'Name', { max: 80 });
+    const email = text(req.body?.email, 'Email', { max: 160 }).toLowerCase();
+    if (!EMAIL_RE.test(email)) throw new HttpError(400, 'Email looks invalid');
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (password.length < 8) throw new HttpError(400, 'Password must have at least 8 characters');
+    const role = req.body?.role === 'organizer' ? 'organizer' : 'fixer';
+    if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email)) throw new HttpError(409, 'Someone with this email already exists');
+    const { lastInsertRowid } = db
+      .prepare('INSERT INTO users (name, email, password_hash, role, skills) VALUES (?, ?, ?, ?, ?)')
+      .run(name, email, hashPassword(password), role, JSON.stringify(role === 'fixer' ? skillList(req.body?.skills) : []));
+    res.status(201).json({ id: Number(lastInsertRowid), name, email, role });
+  });
+
+  api.patch('/team/:id', auth('organizer'), (req, res) => {
+    const id = Number(req.params.id);
+    if (id === req.user.id) throw new HttpError(400, 'You cannot deactivate your own account');
+    if (typeof req.body?.active !== 'boolean') throw new HttpError(400, 'active must be true or false');
+    const { changes } = db.prepare('UPDATE users SET active = ? WHERE id = ?').run(req.body.active ? 1 : 0, id);
+    if (!changes) throw new HttpError(404, 'User not found');
+    res.json({ id, active: req.body.active });
+  });
+
+  // ---------- spare parts ----------
+  const intIn = (v, field, min, max) => {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < min || n > max) throw new HttpError(400, `${field} must be a whole number from ${min} to ${max}`);
+    return n;
+  };
+
+  api.get('/parts', auth(), (_req, res) => {
+    const rows = db
+      .prepare(
+        `SELECT p.*, COALESCE((SELECT SUM(qty) FROM ticket_parts tp WHERE tp.part_id = p.id), 0) AS used
+           FROM parts p ORDER BY p.category, p.name`,
+      )
+      .all();
+    res.json(rows.map((p) => ({ ...p, low: p.stock <= p.min_stock })));
+  });
+
+  api.post('/parts', auth('organizer'), (req, res) => {
+    const name = text(req.body?.name, 'Name', { max: 80 });
+    if (!isCategory(req.body?.category)) throw new HttpError(400, 'Please choose a category');
+    const unitCost = Number(req.body?.unitCost ?? 0);
+    if (!Number.isFinite(unitCost) || unitCost < 0 || unitCost > 10_000) throw new HttpError(400, 'Unit cost is invalid');
+    if (db.prepare('SELECT 1 FROM parts WHERE name = ?').get(name)) throw new HttpError(409, 'A part with this name already exists');
+    const { lastInsertRowid } = db
+      .prepare('INSERT INTO parts (name, category, stock, min_stock, unit_cost) VALUES (?, ?, ?, ?, ?)')
+      .run(name, req.body.category, intIn(req.body?.stock ?? 0, 'Stock', 0, 10_000), intIn(req.body?.minStock ?? 0, 'Minimum stock', 0, 10_000), unitCost);
+    res.status(201).json(db.prepare('SELECT * FROM parts WHERE id = ?').get(lastInsertRowid));
+  });
+
+  api.post('/parts/:id/restock', auth('organizer'), (req, res) => {
+    const qty = intIn(req.body?.qty, 'Quantity', 1, 1000);
+    const { changes } = db.prepare('UPDATE parts SET stock = stock + ? WHERE id = ?').run(qty, Number(req.params.id));
+    if (!changes) throw new HttpError(404, 'Part not found');
+    res.json(db.prepare('SELECT * FROM parts WHERE id = ?').get(Number(req.params.id)));
+  });
+
+  // ---------- email outbox (dev mailbox) ----------
+  api.get('/outbox', auth('organizer'), (_req, res) => {
+    res.json(db.prepare('SELECT o.*, t.code FROM outbox o LEFT JOIN tickets t ON t.id = o.ticket_id ORDER BY o.id DESC LIMIT 50').all());
+  });
+
   // ---------- volunteers & event reports ----------
   const fixerStats = db.prepare(
     `SELECT u.id, u.name, u.skills,
@@ -431,7 +605,7 @@ export function createApp({ db, secret, notify = () => {}, staticDir, rateLimit 
             COALESCE(SUM(t.outcome IN ('fixed', 'partial')), 0) AS fixed,
             ROUND(AVG(t.rating), 2) AS rating, COUNT(t.rating) AS ratings
        FROM users u LEFT JOIN tickets t ON t.fixer_id = u.id AND t.status = 'done'
-      WHERE u.role = 'fixer' AND (? IS NULL OR u.id = ?)
+      WHERE u.role = 'fixer' AND u.active = 1 AND (? IS NULL OR u.id = ?)
       GROUP BY u.id ORDER BY fixed DESC, u.name`,
   );
   const withSkills = (f) => ({ ...f, skills: JSON.parse(f.skills) });

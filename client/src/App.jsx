@@ -12,6 +12,9 @@ import Volunteers from './pages/Volunteers.jsx';
 import CheckIn from './pages/CheckIn.jsx';
 import Home from './pages/Home.jsx';
 import Impact from './pages/Impact.jsx';
+import Inventory from './pages/Inventory.jsx';
+import Mailbox from './pages/Mailbox.jsx';
+import Team from './pages/Team.jsx';
 import Knowledge from './pages/Knowledge.jsx';
 import Login from './pages/Login.jsx';
 import Organizer from './pages/Organizer.jsx';
@@ -44,6 +47,7 @@ function Nav() {
           <NavLink to="/about" className={link}>How it works</NavLink>
           {user && <NavLink to="/workbench" className={link}>Workbench</NavLink>}
           {user && <NavLink to="/knowledge" className={link}>Repair wiki</NavLink>}
+          {user?.role === 'fixer' && <NavLink to="/inventory" className={link}>Parts</NavLink>}
           {user?.role === 'organizer' && <NavLink to="/organize" className={link}>Organize</NavLink>}
         </nav>
         <div className="ml-auto flex items-center gap-3 text-sm">
@@ -116,6 +120,9 @@ export default function App() {
           <Route path="/workbench" element={<RequireAuth><Workbench /></RequireAuth>} />
           <Route path="/knowledge" element={<RequireAuth><Knowledge /></RequireAuth>} />
           <Route path="/organize" element={<RequireAuth roles={['organizer']}><Organizer /></RequireAuth>} />
+          <Route path="/organize/team" element={<RequireAuth roles={['organizer']}><Team /></RequireAuth>} />
+          <Route path="/organize/mailbox" element={<RequireAuth roles={['organizer']}><Mailbox /></RequireAuth>} />
+          <Route path="/inventory" element={<RequireAuth><Inventory /></RequireAuth>} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </main>

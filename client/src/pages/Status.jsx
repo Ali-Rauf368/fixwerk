@@ -47,9 +47,11 @@ export default function Status() {
           <span className={`inline-block rounded-full px-3 py-1 text-sm font-semibold ${OUTCOMES[t.outcome].cls}`}>{OUTCOMES[t.outcome].label}</span>
           {t.notes && <p className="rounded-lg bg-stone-50 p-3 text-sm"><b>{t.fixer}’s note:</b> {t.notes}</p>}
           {(t.outcome === 'fixed' || t.outcome === 'partial') && <p className="text-sm text-brand-700">Thanks for giving it a second life 🌱</p>}
+          {t.parts.length > 0 && <p className="text-sm text-stone-600">Parts used: {t.parts.map((p) => `${p.qty}× ${p.name}`).join(', ')}</p>}
           <Feedback code={t.code} rated={t.rating} onDone={reload} />
         </div>
       )}
+      <Timeline entries={t.timeline} />
     </div>
   );
 }
@@ -80,5 +82,33 @@ function Feedback({ code, rated, onDone }) {
       <ErrorNote error={error} />
       <button className="btn-primary" disabled={!rating}>Send feedback</button>
     </form>
+  );
+}
+
+const OUTCOME_WORDS = { fixed: 'fixed', partial: 'partly fixed', advice: 'advice given', not_fixable: 'not fixable' };
+const LABELS = {
+  checked_in: () => 'Checked in',
+  claimed: (e) => `${e.detail ?? e.actor} started the repair`,
+  assigned: (e) => `Assigned to ${e.detail}`,
+  released: () => 'Back in the queue',
+  finished: (e) => `Finished: ${OUTCOME_WORDS[e.detail] ?? e.detail}`,
+  rated: (e) => `You rated it ${'★'.repeat(Number(e.detail))}`,
+};
+
+function Timeline({ entries }) {
+  if (!entries?.length) return null;
+  return (
+    <section className="mt-6 border-t border-stone-100 pt-4">
+      <h2 className="mb-3 text-sm font-semibold text-stone-500">History</h2>
+      <ol className="relative space-y-3 border-l-2 border-stone-200 pl-4">
+        {entries.map((e, i) => (
+          <li key={i} className="relative text-sm">
+            <span className={`absolute top-1.5 -left-[1.4rem] h-2.5 w-2.5 rounded-full ${i === entries.length - 1 ? 'bg-brand-500' : 'bg-stone-300'}`} />
+            <span className="font-medium">{(LABELS[e.action] ?? (() => e.action))(e)}</span>
+            <span className="ml-2 text-xs text-stone-400">{new Date(e.at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}</span>
+          </li>
+        ))}
+      </ol>
+    </section>
   );
 }

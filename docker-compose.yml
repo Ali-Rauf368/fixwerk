@@ -1,0 +1,14 @@
+services:
+  fixwerk:
+    build: .
+    ports:
+      - "4300:4300"
+    environment:
+      # Change this before using it anywhere real.
+      TOKEN_SECRET: change-me-to-a-long-random-string
+    volumes:
+      - fixwerk-data:/data
+    restart: unless-stopped
+
+volumes:
+  fixwerk-data:

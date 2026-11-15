@@ -1,12 +1,16 @@
 import { useState } from 'react';
+import { api } from '../api.js';
 import { Link, useParams } from 'react-router';
 import { CATEGORIES, ErrorNote, OUTCOMES, Pill, STATUS, Spinner, StatTile, fmtDate, fmtNum, fmtPct } from '../components/ui.jsx';
-import { useApi } from '../hooks.js';
+import { useApi, useAuth } from '../hooks.js';
 import { Avatar } from './Volunteers.jsx';
 
 export default function EventReport() {
   const { id } = useParams();
   const { data, error } = useApi(`/events/${id}/report`);
+  const roster = useApi(`/events/${id}/roster`);
+  const { user } = useAuth();
+  const [rsvpError, setRsvpError] = useState(null);
   const [filter, setFilter] = useState('all');
   if (error) return <div className="space-y-4"><ErrorNote error={error} /><Link to="/" className="btn-ghost">All events</Link></div>;
   if (!data) return <Spinner />;
@@ -27,6 +31,44 @@ export default function EventReport() {
           {event.status === 'live' && <Link to={`/board/${event.id}`} className="btn-ghost">Live board ↗</Link>}
         </div>
       </header>
+
+      {event.status !== 'closed' && roster.data && (
+        <section className="card flex flex-wrap items-center gap-4">
+          <div className="flex-1">
+            <h2 className="font-bold">Volunteers signed up ({roster.data.length})</h2>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {roster.data.map((f) => (
+                <Link key={f.id} to={`/volunteers/${f.id}`} className="flex items-center gap-2 rounded-full bg-stone-100 py-1 pr-3 pl-1 text-sm hover:bg-stone-200">
+                  <Avatar id={f.id} name={f.name} size="h-6 w-6 text-[10px]" /> {f.name.split(' ')[0]}
+                  <span aria-hidden>{f.skills.map((s) => CATEGORIES[s]?.icon).join('')}</span>
+                </Link>
+              ))}
+              {!roster.data.length && <span className="text-sm text-stone-500">Nobody yet.</span>}
+            </div>
+          </div>
+          {user?.role === 'fixer' && (() => {
+            const going = roster.data.some((f) => f.id === user.id);
+            return (
+              <button
+                type="button"
+                className={going ? 'btn-ghost' : 'btn-primary'}
+                onClick={async () => {
+                  setRsvpError(null);
+                  try {
+                    await api(`/events/${event.id}/rsvp`, { method: going ? 'DELETE' : 'POST' });
+                    roster.reload();
+                  } catch (err) {
+                    setRsvpError(err);
+                  }
+                }}
+              >
+                {going ? 'Cancel my sign-up' : 'Sign me up'}
+              </button>
+            );
+          })()}
+          <div className="w-full empty:hidden"><ErrorNote error={rsvpError} /></div>
+        </section>
+      )}
 
       {event.status === 'planned' ? (
         <div className="card text-center text-stone-500">This event hasn’t started yet. Check-in opens on the day. 🗓️</div>
